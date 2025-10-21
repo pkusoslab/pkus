@@ -1,0 +1,1 @@
+dd if=/dev/zero of=/dev/shm/shm1 bs=16M count=1

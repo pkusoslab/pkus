@@ -1,0 +1,11 @@
+virt-install --name ubuntu-sev \
+	--ram 16384 \
+	--disk path=/var/lib/libvirt/images/ubuntu-sev.qcow2,format=qcow2,bus=virtio \
+	--vcpus 16 \
+	--os-variant ubuntu24.04 \
+	--graphics none \
+	--console pty,target_type=serial \
+	--location /var/lib/libvirt/images/ubuntu-24.04.2-live-server-amd64.iso,kernel=casper/vmlinuz,initrd=casper/initrd \
+	--network bridge=virbr0,model=virtio \
+	--extra-args 'console=ttyS0,115200n8 serial' \
+	--boot uefi

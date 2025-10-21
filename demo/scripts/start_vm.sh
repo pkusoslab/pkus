@@ -1,0 +1,13 @@
+qemu-system-x86_64 -m size=16G -smp 16 -cpu host \
+	-hda /var/lib/libvirt/images/ubuntu-sev.qcow2 \
+	-enable-kvm \
+	-nographic \
+	-serial mon:stdio \
+	-drive 'if=pflash,unit=0,format=raw,readonly=on,file=/home/user/workspace/edk2/Build/AmdSev/DEBUG_GCC5/FV/OVMF.fd' \
+	-object 'sev-guest,id=sev0,cbitpos=47,reduced-phys-bits=1,policy=0x1' \
+	-machine 'pc-q35-8.2',vmport=off \
+	-machine 'memory-encryption=sev0' \
+	-device ivshmem-plain,memdev=ivshmem \
+	-object memory-backend-file,id=ivshmem,share=on,mem-path=/dev/shm/shm1,size=16M \
+	-netdev user,id=net0,net=10.0.2.0/24,dhcpstart=10.0.2.15,dns=114.114.114.114,hostfwd=tcp::2222-:22 \
+	-device virtio-net-pci,netdev=net0
