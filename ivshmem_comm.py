@@ -22,9 +22,7 @@ MAX_BLOCK_NUM = 4087 # (16*1024*1024 - 1)//BLOCK_SIZE
 # payload_len uint16: atmost 4096 bytes
 BLOCK_HEADER_FORMAT = '<IHBH'
 
-# 辅助函数
 def get_msg_id(block: bytes) -> int:
-    # 解析block的header，获取msg_id
     header = block[:HEADER_SIZE]
     msg_id, _, _, _ = struct.unpack(BLOCK_HEADER_FORMAT, header)
     return msg_id
