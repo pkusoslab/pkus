@@ -6,33 +6,20 @@ import struct
 import time
 import ctypes
 
-
-# header，block（header+payload）的定义，序列化和反序列化的函数
-LOCK_OFFSET = 0  # 读写锁占用1字节
+LOCK_OFFSET = 0
 READ_RET_OFFSET = 1
 HOST_GUEST_OFFSET = 2
-'''
-由于分层推理时，生成多token需要每次回到模型开头，再重复推理流程。所以最后一层输出之后需要将结果返回到推理开始的那一端（通过ivshmem），
-而且达到输出token上限（或者eos之类的）而得到最终输出之后，也需要交给推理开始的那一端解码输出。所以在内存中应该再拿一部分出来，作为“推
-理开始的那一端此时应该读取内存中的内容”的标识。所以我添加常量READ_RET_OFFSET=1，即第二个字节的共享内存拿来做这个标识。
-HOST_GUEST这个标识不是简单的0或1，而是记录了推理的start_pos（为了生成多token），uint8，一旦开始推理的那一端检测到这个标识被加了1（由推理的末端
-写入），就判断这个值是否达到max token数，达到了就解码输出，否则推下一轮。写是由结束端读取然后加一，写端也要判断是否达到max token数，
-以区分返回的内容是token ids还是下一轮推理所用到的隐藏状态（尽管都是tensor）。
 
-当推理流程是guest-host-guest-host时，第二轮guest（开始端）还没发第一批的输出呢，host就自己读到脏东西了
-这是因为host发完output后马上进了下一轮，又读取了SHM，自己读自己
-要添加一个设计，拿第三个字节来作为里面的内容是host还是guest写入的，0为host，1为guest
-'''
 BLOCK_SIZE = 4096 + 9
 HEADER_SIZE = 9
 PAYLOAD_SIZE = 4096
-MAX_BLOCK_NUM = 4087 # (16*1024*1024 - 1)//BLOCK_SIZE，1是读写锁使用的1个字节
+MAX_BLOCK_NUM = 4087 # (16*1024*1024 - 1)//BLOCK_SIZE
 
-# <即小端法，I = uint32, H = uint16, B = uint8
-# msg_id uint32 一层输出的所有tensor共用一个msg_id
-# seq_id uint16 该序列的第几个block
-# is_last uint8 该block是否是最后一个
-# payload_len uint16 该block的payload长度，上限是4096，所以uint16就够了
+# < = small endian，I = uint32, H = uint16, B = uint8
+# msg_id uint32: output tensor from the same forward pass has the same msg_id
+# seq_id uint16: the sequence number of this block in the whole tensor bytes
+# is_last uint8
+# payload_len uint16: atmost 4096 bytes
 BLOCK_HEADER_FORMAT = '<IHBH'
 
 # 辅助函数
@@ -58,11 +45,10 @@ def write_host_guest_uint8(shm, value):
         value = value & 0xFF
     shm[HOST_GUEST_OFFSET:HOST_GUEST_OFFSET + 1] = value.to_bytes(1, 'little')
 
-def clear_shm(shm): # 清空共享内存
+def clear_shm(shm):
     ctypes.memset(ctypes.addressof(ctypes.c_char.from_buffer(shm, HOST_GUEST_OFFSET + 1)), 0, 16)
 
 
-# 一层的输出->字节
 def tensor2bytes(tensor: torch.Tensor) -> bytes:
     # func_start = time.time()
     t = tensor.detach()
@@ -118,10 +104,8 @@ def tensor_bytes_and_module_name2blocks(tensor_bytes: bytes, msg_id: int, module
     #     log_f.write(f"{(func_end - func_start):.6f}\n")
     return blocks
 
-# blocks->tensor的字节序列和module_name
 def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
     # func_start = time.time()
-    # 按seq_id排序
     blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
     total_data_bytes = b''.join(payloads)
@@ -135,7 +119,6 @@ def blocks2tensor_bytes_and_module_name(blocks: list) -> tuple:
     #     log_f.write(f"{(func_end - func_start):.6f}\n")
     return tensor_bytes, module_name
 
-# tensor的字节序列->给下一层的tensor
 def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
     # func_start = time.time()
     meta_len = int.from_bytes(data[:4], 'little')
@@ -159,15 +142,6 @@ def bytes2tensor(data: bytes, use_gpu: bool = False) -> torch.Tensor:
         return t.cuda()
     return t
 
-
-
-
-
-# 共享内存通信逻辑：不冲突地从共享内存读写，利用共享内存的第一个字节管理
-# 虽然host和guest访问shared memory的方式不同，但已经在run_host/guest中处理，将其作为字节数组shm传入
-# 一次锁住整块共享内存，因为实际场景下推完一层交给下一层是单向的，也只有组装起完整的tensor才能开始推下一层。
-
-# 虽然不是原子的，但是同时只有一方写，另一方只读，所以只要写了一点，就不可能在写完之前读到，再不就是读空。反之亦然
 def acquire_lock(shm):
     while True:
         if shm[LOCK_OFFSET] == 0:
@@ -187,7 +161,7 @@ def write_blocks(shm, blocks, role):
         
         offset = HOST_GUEST_OFFSET + 1
         block_count = 0
-        copy_time = 0.0 # 记录复制内存的时间
+        copy_time = 0.0
         for block in blocks:
             if block_count > 0 and block_count % MAX_BLOCK_NUM == 0:
                 # release_lock(shm)
@@ -204,14 +178,14 @@ def write_blocks(shm, blocks, role):
 
 def read_blocks(shm, role):
     # acquire_lock(shm)
-    should_clear = True # 空的或没有权限读，就不能清空。只有读到了才能清空
+    should_clear = True # can't clear if nothing read or no permission to read
     have_blocks = False
     try:
         blocks = []
         offset = HOST_GUEST_OFFSET + 1
-        copy_time = 0.0 # 记录复制内存的时间
-        while offset + HEADER_SIZE <= len(shm): # 实际上就是offset <= len(shm)，这么写保险些而已（下一行）
-            if role == "host" and read_host_guest_uint8(shm) == 0: # host写入的不能host读
+        copy_time = 0.0
+        while offset + HEADER_SIZE <= len(shm):
+            if role == "host" and read_host_guest_uint8(shm) == 0:
                 should_clear = False
                 continue
             if role == "guest" and read_host_guest_uint8(shm) == 1:
@@ -232,7 +206,8 @@ def read_blocks(shm, role):
             if is_last:
                 break
             else:
-                # 可能读完了整个共享内存，仍没有读完整个tensor，这时要清空共享内存并从头开始，等1秒让写方接着写
+                # havn't read the full tensor even reach the end of shm
+                # so clear shm and start from beginning, wait 1 second for writer to write more
                 if len(blocks) > 0 and len(blocks) % MAX_BLOCK_NUM == 0:
                     clear_shm(shm)
                     # release_lock(shm)
@@ -240,7 +215,6 @@ def read_blocks(shm, role):
                     # acquire_lock(shm)
                     offset = HOST_GUEST_OFFSET + 1
         if have_blocks:
-            # print(f"{role} 读，读取block数量{len(blocks)}")
             pass
         return blocks
     finally:
@@ -249,9 +223,6 @@ def read_blocks(shm, role):
         # release_lock(shm)
 
 
-
-# 初始化时guest用来反序列化得到lora相关权重或配置字节序列的函数，和针对tensor的处理区分开
-# 从完整模型中提取lora权重，获取lora配置，序列化权重和配置
 def lora_weight_config2bytes(model):
     lora_state_dict = {}
     for name, param in model.named_parameters():
@@ -259,7 +230,6 @@ def lora_weight_config2bytes(model):
             lora_state_dict[name] = param.cpu().clone()
     lora_config = model.peft_config['default'].to_dict()
 
-    # 遍历配置字典，将所有set类型转换为list类型，否则json序列化会报错
     for key, value in lora_config.items():
         if isinstance(value, set):
             lora_config[key] = list(value)
@@ -269,12 +239,11 @@ def lora_weight_config2bytes(model):
     lora_weights_bytes = buffer.getvalue()
 
     lora_config_bytes = json.dumps(lora_config).encode('utf-8')
-    # 打印两个字节序列的大小（单位为KB）
     print(f"LoRA weights size: {len(lora_weights_bytes) / 1024:.2f} KB")
     print(f"LoRA config size: {len(lora_config_bytes) / 1024:.2f} KB")
     return lora_weights_bytes, lora_config_bytes
 
-# 由于将lora权重和配置一次传输，所以第一批（权重）的块不能设置is_last=1，需要特判
+
 def bytes2blocks(data_bytes: bytes, msg_id: int, force_is_not_last: bool=False) -> list:
     blocks = []
     total_len = len(data_bytes)
@@ -294,18 +263,15 @@ def bytes2blocks(data_bytes: bytes, msg_id: int, force_is_not_last: bool=False) 
     return blocks
 
 def blocks2bytes(blocks: list) -> bytes:
-    # 按seq_id排序
     blocks.sort(key=lambda b: struct.unpack('<H', b[4:6])[0])
     payloads = [b[HEADER_SIZE:HEADER_SIZE + struct.unpack('<H', b[7:9])[0]] for b in blocks]
     payload_bytes = b''.join(payloads)
     return payload_bytes
 
 def bytes2lora_weight_config(lora_weights_bytes, lora_config_bytes):
-    # 反序列化权重
     buffer = io.BytesIO(lora_weights_bytes)
     lora_state_dict = torch.load(buffer, map_location='cpu')
 
-    # 反序列化配置
     lora_config = json.loads(lora_config_bytes.decode('utf-8'))
     return lora_state_dict, lora_config
 
