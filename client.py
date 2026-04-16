@@ -10,7 +10,10 @@ from safetensors.torch import load_file, save_file
 from pdb import set_trace as st
 
 import ivshmem_comm as ic
-from pkus.model_def import GuestLoraModel, replace_lora_layers
+# from pkus.model_def import GuestLoraModel, replace_lora_layers
+
+from model_def import GuestLoraModel, replace_lora_layers
+
 
 # set different prompt
 PROMPT_DATABASE = "sst2"
@@ -21,8 +24,9 @@ PROMPT_DATABASE = "sst2"
 PRUNED = False
 
 # set different base model
-BASE_MODEL = "llama-3-1b"
+# BASE_MODEL = "llama-3-1b"
 # BASE_MODEL = "gpt2-large"
+BASE_MODEL = "llama-3-8b-instruct"
 
 # set different lora model (trained from different datasets)
 LORA_DATABASE = "sst2"
@@ -30,7 +34,7 @@ LORA_DATABASE = "sst2"
 # LORA_DATABASE = "mnli"
 
 # use GPU/CPU if set False
-TEST_OUR_METHOD = True
+TEST_OUR_METHOD = False
 
 PRUNE_RATIO = 0.8 if LORA_DATABASE == "sst2" else (0.64 if LORA_DATABASE == "squad" else 0.66)
 
@@ -51,8 +55,6 @@ GUEST_SHM_PATH = "/sys/bus/pci/devices/0000:00:02.0/resource2"
 
 RR = 0.0001 # round-robin sleep interval
 DEFAULT_DTYPE = torch.float32
-
-
 
 
 shared_state = {
@@ -109,6 +111,7 @@ def guest_main(set_multi_thread=False):
         ic.write_host_guest_uint8(shm, 1)
         while True:
             blocks = ic.read_blocks(shm, "guest")
+            # print(f"guest读到{len(blocks)} blocks\n")
             if len(blocks) > 0:
                 split_point = ic.get_msg_id(blocks[0])
                 lora_weight_blocks = blocks[:split_point]
@@ -315,9 +318,11 @@ def host_main():
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_dir,
         dtype=DEFAULT_DTYPE,
-        device_map=None,
+        # device_map=None,
+        # device_map="auto" if not TEST_OUR_METHOD else None
+        device_map="auto" if torch.cuda.is_available() else None
     )
-    base_model.to(device)
+    # base_model.to(device)
     
     if PRUNED:
         _, unzero_modules = check_lora_weights_zero(lora_model_dir)
@@ -359,21 +364,22 @@ def host_main():
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        for name, param in model.named_parameters():
-            if "lora" in name.lower():
-                parts = name.split('.')
-                if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
-                    new_name = '.'.join(parts[3:-3])
-                    new_name2 = '.'.join(parts[3:-2])
-                else:
-                    new_name = '.'.join(parts[2:-3])
-                    new_name2 = '.'.join(parts[2:-2])
-                if new_name in lora_modules:
-                    for state_dict_key in state_dict.keys():
-                        if new_name2 in state_dict_key:
-                            param.data = state_dict[state_dict_key]
-        # model.load_state_dict(state_dict, strict=False)
+        # state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
+        # for name, param in model.named_parameters():
+        #     if "lora" in name.lower():
+        #         parts = name.split('.')
+        #         if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
+        #             new_name = '.'.join(parts[3:-3])
+        #             new_name2 = '.'.join(parts[3:-2])
+        #         else:
+        #             new_name = '.'.join(parts[2:-3])
+        #             new_name2 = '.'.join(parts[2:-2])
+        #         if new_name in lora_modules:
+        #             for state_dict_key in state_dict.keys():
+        #                 if new_name2 in state_dict_key:
+        #                     param.data = state_dict[state_dict_key]
+    
+    
     model.eval()
     
     total_time = 0.0 # host
@@ -388,6 +394,7 @@ def host_main():
         lora_config_blocks = ic.bytes2blocks(lora_config_bytes, msg_id=lora_weights_block_num)
 
         packed_blocks = lora_weight_blocks + lora_config_blocks
+        print(f"host发送{len(packed_blocks)}个lora blocks给guest\n")
         ic.clear_shm(shm)
         ic.write_ret_uint8(shm, 0)
         ic.write_blocks(shm, packed_blocks, "host")
@@ -414,7 +421,7 @@ def host_main():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=256,
-            do_sample=False,  # 禁用采样 -> 更确定性
+            do_sample=False,
             eos_token_id=tokenizer.eos_token_id,
         )
     gen_end = time.time()
@@ -423,10 +430,85 @@ def host_main():
     print(output_text)
     total_end = time.time()
     total_time = total_end - init_start
-    # print(f"[HOST] initialization time: {init_time:.6f} s")
+    print(f"[HOST] initialization time: {init_time:.6f} s")
     print(f"[HOST] generation time: {gen_end - gen_start:.6f} s")
     print(f"[HOST] length of the output tokens: {len(output_ids[0])}")
-    # print(f"[HOST] full time: {total_time:.6f} s")
+    print(f"[HOST] full time: {total_time:.6f} s")
+
+def test_basic_inference():
+    tokenizer = AutoTokenizer.from_pretrained(base_model_dir)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_dir,
+        dtype=DEFAULT_DTYPE,
+        device_map="auto",
+    )
+    # base_model.eval()
+    model = PeftModel.from_pretrained(
+        base_model,
+        lora_model_dir,
+        device_map="auto",
+        torch_dtype=DEFAULT_DTYPE,
+    )
+    model.eval()
+
+    inputs = tokenizer(
+        "How many states does the US have?",
+        return_tensors="pt",
+        padding=True,
+        truncation=True
+    ).to(model.device) 
+
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=256,
+            do_sample=False,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    
+    output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    print(output_text)
+
+
+# transfer 80MiB tensor string
+def test_big_data(client_role):
+    shm_path = HOST_SHM_PATH if client_role == "host" else GUEST_SHM_PATH
+    with open(shm_path, "r+b") as f:
+        shm = mmap.mmap(f.fileno(), 16 * 1024 * 1024)
+        ic.clear_shm(shm)
+
+        if client_role == "guest":
+            print("[Guest] Waiting for data from host...")
+            blocks = []
+            while True:
+                blocks = ic.read_blocks(shm, "guest")
+                if len(blocks) > 0 and ic.get_msg_id(blocks[0]) == 1:
+                    break
+                else:
+                    print("[Guest] No data received yet. Waiting...")
+                    time.sleep(0.01)
+            print(f"[Guest] Received {len(blocks)} blocks from host.")
+            received_bytes = ic.blocks2bytes(blocks)
+            expected_bytes = bytes(80 * 1024 * 1024)
+            if received_bytes == expected_bytes:
+                print("[Guest] Data matches expected content.")
+            else:
+                print(f"[Guest] Data mismatch! Received {len(received_bytes)} bytes.")
+
+        elif client_role == "host":
+            data = bytes(80 * 1024 * 1024)  # 80MiB
+            blocks = ic.bytes2blocks(data, msg_id=1)
+            print(f"[Host] Sending {len(blocks)} blocks to guest...")
+            ic.write_blocks(shm, blocks, "host")
+
+        else:
+            print("未知client_role")
+            return
+
+
 
 def test_host():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -438,7 +520,9 @@ def test_host():
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_dir,
         torch_dtype=DEFAULT_DTYPE,
-        device_map=None,
+        # device_map=None,
+        # device_map="auto" if not TEST_OUR_METHOD else None
+        device_map="auto" if torch.cuda.is_available() else None
     )
     if PRUNED:
         _, unzero_modules = check_lora_weights_zero(lora_model_dir)
@@ -480,47 +564,47 @@ def test_host():
             task_type="CAUSAL_LM",
         )
         model = get_peft_model(base_model, lora_config)
-        state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
-        for name, param in model.named_parameters():
-            if "lora" in name.lower():
-                parts = name.split('.')
-                if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
-                    new_name = '.'.join(parts[3:-3])
-                    new_name2 = '.'.join(parts[3:-2])
-                else:
-                    new_name = '.'.join(parts[2:-3])
-                    new_name2 = '.'.join(parts[2:-2])
-                if new_name in lora_modules:
-                    for state_dict_key in state_dict.keys():
-                        if new_name2 in state_dict_key:
-                            param.data = state_dict[state_dict_key]
-        # model.load_state_dict(state_dict, strict=False)
+        # state_dict = load_file(os.path.join(lora_model_dir, "adapter_model.safetensors"), device="cuda" if torch.cuda.is_available() else "cpu")
+        # for name, param in model.named_parameters():
+        #     if "lora" in name.lower():
+        #         parts = name.split('.')
+        #         if "squad" in PROMPT_DATABASE and "llama" in BASE_MODEL.lower():
+        #             new_name = '.'.join(parts[3:-3])
+        #             new_name2 = '.'.join(parts[3:-2])
+        #         else:
+        #             new_name = '.'.join(parts[2:-3])
+        #             new_name2 = '.'.join(parts[2:-2])
+        #         if new_name in lora_modules:
+        #             for state_dict_key in state_dict.keys():
+        #                 if new_name2 in state_dict_key:
+        #                     param.data = state_dict[state_dict_key]
 
-    model.to(device=device, dtype=DEFAULT_DTYPE)
+
+    # model.to(device=device, dtype=DEFAULT_DTYPE)
     model.eval()
 
-    is_peft = isinstance(model, PeftModel)
-    print(f"is PeftModel: {is_peft}")
-    try:
-        from peft.tuners.lora.layer import Linear as LoraLinear
-    except Exception:
-        LoraLinear = None
-    lora_count = sum(1 for _, m in model.named_modules() if LoraLinear is not None and isinstance(m, LoraLinear))
-    print(f"LoRA Linear layer count: {lora_count}")
+    # is_peft = isinstance(model, PeftModel)
+    # print(f"is PeftModel: {is_peft}")
+    # try:
+    #     from peft.tuners.lora.layer import Linear as LoraLinear
+    # except Exception:
+    #     LoraLinear = None
+    # lora_count = sum(1 for _, m in model.named_modules() if LoraLinear is not None and isinstance(m, LoraLinear))
+    # print(f"LoRA Linear layer count: {lora_count}")
 
-    device_counts = {}
-    for name, p in model.named_parameters():
-        d = str(p.device)
-        device_counts[d] = device_counts.get(d, 0) + 1
-    print("Parameter device distribution (device: param_count):", device_counts)
+    # device_counts = {}
+    # for name, p in model.named_parameters():
+    #     d = str(p.device)
+    #     device_counts[d] = device_counts.get(d, 0) + 1
+    # print("Parameter device distribution (device: param_count):", device_counts)
 
     inputs = tokenizer(
         prompt,
         return_tensors="pt",
         padding=True,
         truncation=True
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    ).to(model.device)
+    # inputs = {k: v.to(device) for k, v in inputs.items()}
 
     gen_start = time.time()
     with torch.no_grad():
@@ -583,10 +667,13 @@ if __name__ == "__main__":
         if TEST_OUR_METHOD:
             host_main()
         else:
+            # test_big_data(client_role)
             test_host()
+            # test_basic_inference()
         # test_rw_host()
     else:
         if not TEST_OUR_METHOD:
+            # est_big_data(client_role)
             test_host()
         else:
             guest_main(set_multi_thread=False)

@@ -1,4 +1,4 @@
-__package__ = "pkus".model_def
+__package__ = "model_def"
 
 import time, torch
 from pathlib import Path
